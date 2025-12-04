@@ -166,6 +166,39 @@ class MCTSSolver {
             }
             this.cacheMisses++;
             
+            // Check for instant win condition (adjacent + not stunned + 4+ AP)
+            if (!node.isTerminal() && !node.isProven() && this.hasInstantWin(node.state)) {
+                const currentPlayer = node.state.currentPlayer;
+                node.proofStatus = 'proven-win';
+                node.proofPlayer = currentPlayer;
+                
+                // Cache instant win position
+                const instantWinHash = this.hashState(node.state);
+                this.transpositionTable.set(instantWinHash, {
+                    proofStatus: node.proofStatus,
+                    proofPlayer: node.proofPlayer
+                });
+                
+                this.provenNodes++;
+                
+                // Backpropagate the proven win
+                this.backpropagateWithProof(node, currentPlayer);
+                
+                if ((i + 1) % 1000 === 0) {
+                    const hitRate = this.cacheHits + this.cacheMisses > 0 
+                        ? (this.cacheHits / (this.cacheHits + this.cacheMisses) * 100).toFixed(1)
+                        : '0.0';
+                    const proofInfo = root.isProven() ? ` [PROVEN: ${root.proofStatus}]` : '';
+                    console.log(`Iteration ${i + 1}/${this.iterations}: Root win rate = ${(root.wins / root.visits * 100).toFixed(2)}%${proofInfo} | Proven: ${this.provenNodes} | Cache: ${this.transpositionTable.size} (${hitRate}% hit)`);
+                    
+                    // Save cache periodically (every 10k iterations)
+                    if ((i + 1) % 10000 === 0) {
+                        this.saveCache();
+                    }
+                }
+                continue;
+            }
+            
             // Expansion
             if (!node.isTerminal() && !node.isProven()) {
                 if (node.untriedMoves === null) {
@@ -270,6 +303,13 @@ class MCTSSolver {
         if (currentPlayer.ap >= 1) {
             const validMoves = this.getValidMoves(state, currentPlayer.position);
             for (const pos of validMoves) {
+                // OPTIMIZATION: Don't move back to the position we just came from
+                if (state.lastPosition && 
+                    state.lastPosition.row === pos.row && 
+                    state.lastPosition.col === pos.col) {
+                    continue; // Skip this move - it's backtracking
+                }
+                
                 moves.push({
                     type: 'move',
                     targetRow: pos.row,
@@ -300,8 +340,13 @@ class MCTSSolver {
             });
         }
         
-        // End turn (always available)
-        moves.push({ type: 'endTurn', description: 'End Turn' });
+        // End turn - OPTIMIZATION: Only allow if we actually did something this turn
+        // (i.e., AP changed from the start of the turn, or we're at max AP)
+        // This prevents "do nothing and end turn" which is strictly worse than resting
+        const didSomethingThisTurn = currentPlayer.ap !== state.turnStartAP || currentPlayer.ap >= 6;
+        if (didSomethingThisTurn) {
+            moves.push({ type: 'endTurn', description: 'End Turn' });
+        }
         
         return moves;
     }
@@ -320,6 +365,9 @@ class MCTSSolver {
                 break;
                 
             case 'move':
+                // Track the position we're leaving (for backtracking prevention)
+                newState.lastPosition = { row: player.position.row, col: player.position.col };
+                
                 newState.board[player.position.row][player.position.col] = null;
                 newState.board[move.targetRow][move.targetCol] = newState.currentPlayer;
                 player.position = { row: move.targetRow, col: move.targetCol };
@@ -357,6 +405,13 @@ class MCTSSolver {
         const enemyId = state.currentPlayer === 1 ? 2 : 1;
         player.ap -= 3;
         
+        // Check if first strike hits
+        let firstStrikeHit = false;
+        const firstAdjacentEnemies = this.getAdjacentEnemies(state, player.position, enemyId);
+        if (firstAdjacentEnemies.length > 0) {
+            firstStrikeHit = true;
+        }
+        
         // Perform 3 combos
         for (let combo = 0; combo < 3; combo++) {
             // Deal 2 damage to all adjacent enemies
@@ -369,13 +424,19 @@ class MCTSSolver {
                 }
             }
             
-            // Random move (1-2 squares)
-            const validMoves = this.getValidMoves(state, player.position);
-            if (validMoves.length > 0) {
-                const randomMove = validMoves[Math.floor(Math.random() * validMoves.length)];
-                state.board[player.position.row][player.position.col] = null;
-                state.board[randomMove.row][randomMove.col] = state.currentPlayer;
-                player.position = { row: randomMove.row, col: randomMove.col };
+            // Only move after dealing damage:
+            // - If first strike hit, only move on the LAST combo (combo === 2)
+            // - If first strike missed, move after each strike to try to get in range
+            const shouldMove = firstStrikeHit ? (combo === 2) : true;
+            
+            if (shouldMove) {
+                const validMoves = this.getValidMoves(state, player.position);
+                if (validMoves.length > 0) {
+                    const randomMove = validMoves[Math.floor(Math.random() * validMoves.length)];
+                    state.board[player.position.row][player.position.col] = null;
+                    state.board[randomMove.row][randomMove.col] = state.currentPlayer;
+                    player.position = { row: randomMove.row, col: randomMove.col };
+                }
             }
         }
         
@@ -409,6 +470,45 @@ class MCTSSolver {
         if (rowDiff !== 0 && colDiff !== 0 && rowDiff !== colDiff) return false;
         
         return true;
+    }
+
+    // Check if current player has an instant win
+    // Win condition: Adjacent to enemy, not stunned, and 4+ AP
+    // Can deal 8 damage with 4 strikes OR 6+ damage with lunging + strikes
+    hasInstantWin(state) {
+        const currentPlayer = state.players[state.currentPlayer];
+        const enemyId = state.currentPlayer === 1 ? 2 : 1;
+        const enemy = state.players[enemyId];
+        
+        // Must not be stunned
+        if (currentPlayer.stunned) {
+            return false;
+        }
+        
+        // Case 1: Already adjacent with 4+ AP
+        const adjacentEnemies = this.getAdjacentEnemies(state, currentPlayer.position, enemyId);
+        if (adjacentEnemies.length > 0 && currentPlayer.ap >= 4) {
+            // With 4 AP adjacent to enemy:
+            // - 4 strikes = 8 damage (kills from 7 HP)
+            // - 1 lunging (3 AP) + 1 strike = 8 damage minimum (6 from lunging, 2 from strike)
+            return enemy.hp <= 7;
+        }
+        
+        // Case 2: Not adjacent but have 5+ AP (can move adjacent for 1 AP, then have 4+ left)
+        // On a 3x3 board, any position can reach any other position in 1-2 moves
+        if (currentPlayer.ap >= 5) {
+            // Check if we can move adjacent to enemy
+            const validMoves = this.getValidMoves(state, currentPlayer.position);
+            for (const move of validMoves) {
+                const adjacentFromMove = this.getAdjacentEnemies(state, move, enemyId);
+                if (adjacentFromMove.length > 0) {
+                    // Can move adjacent and will have 4+ AP remaining
+                    return enemy.hp <= 7;
+                }
+            }
+        }
+        
+        return false;
     }
 
     // Get adjacent enemy positions
@@ -448,6 +548,12 @@ class MCTSSolver {
         
         // Switch players
         state.currentPlayer = state.currentPlayer === 1 ? 2 : 1;
+        
+        // Track starting AP for the new player's turn (to detect "do nothing" turns)
+        state.turnStartAP = state.players[state.currentPlayer].ap;
+        
+        // Clear lastPosition when turn ends (backtracking only matters within a turn)
+        state.lastPosition = null;
     }
 
     // Simulate game to completion with random moves
@@ -683,7 +789,9 @@ function analyzeGame(iterationsPerRun = 1000000) {
             2: { hp: 7, maxHp: 7, ap: 0, position: { row: 2, col: 1 }, stunned: false, stunnedThisTurn: false }
         },
         currentPlayer: 1,
-        gameOver: false
+        gameOver: false,
+        turnStartAP: 0, // Track AP at start of turn to detect "do nothing" turns
+        lastPosition: null // Track previous position to prevent immediate backtracking
     };
     
     // Place players on board
@@ -698,7 +806,7 @@ function analyzeGame(iterationsPerRun = 1000000) {
 }
 
 // Run MCTS analysis in a loop until proven
-function solveUntilProven(iterationsPerRun = 1000000, maxRuns = 100) {
+function solveUntilProven(iterationsPerRun = 500000000, maxRuns = 1) {
     console.log("=== Starting continuous solver ===");
     console.log(`Will run ${iterationsPerRun.toLocaleString()} iterations per batch`);
     console.log(`Maximum ${maxRuns} batches (press Ctrl+C to stop early)\n`);
